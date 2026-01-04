@@ -36,9 +36,12 @@ async def query(
 
             async for chunk in stream:
                 if chunk.choices[0].delta.content is not None:
-                    token = chunk.choices[0].delta.content
-                    full_content.append(token)
-                    token_count += 1
+                    token_str = chunk.choices[0].delta.content
+                    full_content.append(token_str)
+
+                    # 改进 token 计数：按字符粗估（平均 3 字符 ≈ 1 token，对中英文适用）
+                    new_tokens = max(1, len(token_str) // 3)
+                    token_count += new_tokens
 
                     if first_token_time is None:
                         first_token_time = time.time()
@@ -47,7 +50,7 @@ async def query(
                         await progress_callback(task_id, token_count)
 
                     if content_callback:
-                        await content_callback(task_id, token)
+                        await content_callback(task_id, token_str)
 
             total_time = time.time() - start_time
             token_rate = token_count / total_time if total_time > 0 else 0
@@ -96,8 +99,24 @@ class ProgressManager:
         self.last_displayed_count = 0
         self.last_saved_msg = ""  # 最近一次保存提示
 
+        # 新增：吞吐量采样
+        self.throughput_samples = []  # 每秒采样一次的瞬时速率
+        self.last_sample_time = time.time()
+        self.last_sample_tokens = 0
+
     async def update_progress(self, task_id: int, token_count: int):
         self.progress[task_id] = token_count
+
+        # 实时吞吐采样（每秒一次）
+        current_time = time.time()
+        current_total_tokens = sum(self.progress)
+        if current_time - self.last_sample_time >= 1.0:
+            if current_time - self.last_sample_time > 0:
+                rate = (current_total_tokens - self.last_sample_tokens) / (current_time - self.last_sample_time)
+                self.throughput_samples.append(rate)
+            self.last_sample_time = current_time
+            self.last_sample_tokens = current_total_tokens
+
         await self.render()
 
     async def append_content(self, task_id: int, token: str):
@@ -189,8 +208,6 @@ class ProgressManager:
         return sum(self.progress) / elapsed if elapsed > 0 else 0
 
 
-
-
 async def load_test(base_url, model, concurrency=1, requests=1, api_key="xxx", output_dir="outputs"):
     semaphore = asyncio.Semaphore(concurrency)
     max_tokens = 500
@@ -221,7 +238,9 @@ async def load_test(base_url, model, concurrency=1, requests=1, api_key="xxx", o
 
     await progress_manager.render()  # 初始空界面
 
+    test_start_time = time.time()
     await asyncio.gather(*[run_task(i) for i in range(requests)])
+    total_elapsed = time.time() - test_start_time
 
     # 最终统计
     successful = [r for r in results if r is not None and r.get("success", False)]
@@ -229,10 +248,24 @@ async def load_test(base_url, model, concurrency=1, requests=1, api_key="xxx", o
         print(f"\n{model}: 所有请求均失败")
         return
 
-    rates = [r["token_rate"] for r in successful]
+    total_tokens = sum(r["token_count"] for r in successful)
+    overall_avg_throughput = total_tokens / total_elapsed if total_elapsed > 0 else 0
+
+    # 新增：峰值吞吐和稳定吞吐
+    if progress_manager.throughput_samples:
+        peak_throughput = max(progress_manager.throughput_samples)
+        # 稳定吞吐：去掉前10%和后10%采样点后平均
+        samples = sorted(progress_manager.throughput_samples)
+        trim = max(1, len(samples) // 10)
+        steady_samples = samples[trim:-trim] if len(samples) > 2 * trim else samples
+        steady_throughput = mean(steady_samples) if steady_samples else 0
+    else:
+        peak_throughput = steady_throughput = 0
+
     ttfts = [r["ttft"] for r in successful]
     tgls = [r["tgl"] for r in successful]
     token_counts = [r["token_count"] for r in successful]
+    individual_rates = [r["token_rate"] for r in successful]
 
     def percentile(data, p):
         s = sorted(data)
@@ -241,12 +274,20 @@ async def load_test(base_url, model, concurrency=1, requests=1, api_key="xxx", o
 
     print("\n" + "="*80)
     print(f"基准测试完成: {model}")
-    print(f"成功请求: {len(successful)}/{requests}")
-    print(f"平均输出长度: {mean(token_counts):.1f} tokens")
-    print(f"平均速度: {mean(rates):.2f} tokens/s "
-          f"(P50: {percentile(rates,0.5):.2f}, P99: {percentile(rates,0.99):.2f})")
-    print(f"平均TTFT: {mean(ttfts):.3f}s")
-    print(f"平均每token延迟: {mean(tgls):.4f}s")
+    print(f"并发数: {concurrency} | 总请求: {requests} | 成功: {len(successful)}")
+    print(f"总耗时: {total_elapsed:.1f}s | 总生成 tokens: {total_tokens}")
+    print(f"╔══════════════════ 吞吐量指标 ══════════════════")
+    print(f"║ 峰值吞吐量              : {peak_throughput:.2f} tokens/s")
+    print(f"║ 稳定阶段吞吐量            : {steady_throughput:.2f} tokens/s")
+    print(f"║ 整体平均吞吐量（含空闲）  : {overall_avg_throughput:.2f} tokens/s")
+    print(f"╚══════════════════════════════════════════════")
+    print(f"╔══════════════════ 延迟指标 ════════════════════")
+    print(f"║ 平均输出长度: {mean(token_counts):.1f} tokens")
+    print(f"║ 平均 TTFT: {mean(ttfts):.3f}s   (P50: {percentile(ttfts,0.5):.3f}s)")
+    print(f"║ 平均 TGL:  {mean(tgls):.4f}s")
+    if individual_rates:
+        print(f"║ 单请求平均速率: {mean(individual_rates):.2f} tokens/s")
+    print(f"╚══════════════════════════════════════════════")
     print(f"所有响应已保存至: {os.path.abspath(output_dir)}")
     print("="*80)
 
@@ -254,10 +295,10 @@ async def load_test(base_url, model, concurrency=1, requests=1, api_key="xxx", o
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LLM 并发基准测试")
     parser.add_argument("--base-url", type=str, default="http://localhost:11434/v1")
-    parser.add_argument("--model", type=str, default="qwen2.5:7b")
+    parser.add_argument("--model", type=str, default="qwen2.5:72b")
     parser.add_argument("--api-key", type=str, default="xxx")
-    parser.add_argument("--concurrency", type=int, default=2, help="并发数")
-    parser.add_argument("--requests", type=int, default=4, help="总请求数")
+    parser.add_argument("--concurrency", type=int, default=8, help="并发数")
+    parser.add_argument("--requests", type=int, default=8, help="总请求数")
     parser.add_argument("--output-dir", type=str, default="outputs", help="响应保存目录")
 
     args = parser.parse_args()
