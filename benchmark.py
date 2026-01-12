@@ -3,6 +3,7 @@ import asyncio
 import os
 import shutil
 import time
+import traceback
 from statistics import mean
 
 from openai import AsyncOpenAI
@@ -35,7 +36,7 @@ async def query(
             )
 
             async for chunk in stream:
-                if chunk.choices[0].delta.content is not None:
+                if len(chunk.choices) >0 and chunk.choices[0].delta.content is not None:
                     token_str = chunk.choices[0].delta.content
                     full_content.append(token_str)
 
@@ -67,6 +68,7 @@ async def query(
                 "success": True,
             }
         except Exception as e:
+            print(f"请求失败: {traceback.format_exc()}")
             error_msg = f"请求失败: {str(e)}"
             return {
                 "token_count": 0,
